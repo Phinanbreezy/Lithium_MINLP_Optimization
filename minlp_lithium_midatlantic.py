@@ -1,269 +1,336 @@
 import pandas as pd
 from pyomo.environ import (
-    ConcreteModel, Set, Param, Var,
-    NonNegativeReals, Binary,
-    Objective, Constraint, minimize,
-    value, SolverFactory
+    ConcreteModel, Set, Param, Var, NonNegativeReals, Binary,
+    Objective, Constraint, Expression, SolverFactory, value, minimize
 )
 
-# -------------------------------------------------------------
-# 1. Load Excel sheets
-# -------------------------------------------------------------
-excel_file = "MINLP_GIS_InputData_MidAtlantic.xlsx"
+# ---------
+# 1. Basic settings and file paths
+# --------
 
-demand_df = pd.read_excel(excel_file, sheet_name="Demand nodes")
-sites_df  = pd.read_excel(excel_file, sheet_name="Candidate_sites")
-dist_df   = pd.read_excel(excel_file, sheet_name="Distance_Matrix")
+DATA_FILE = "MINLP_GIS_InputData_MidAtlantic.xlsx"
 
-# Strip whitespace from all column names (fixes 'OBJECTID ' issue)
-demand_df.columns = demand_df.columns.str.strip()
-sites_df.columns  = sites_df.columns.str.strip()
-dist_df.columns   = dist_df.columns.str.strip()
+# Limit number of candidate sites used in the run
+MAX_SITES_FOR_RUN = 50
+
+# Cost parameters
+TRANSPORT_COST_PER_TKM = 0.5      # $ per tonne-km
+CAPITAL_COST_COEFF = 5e4          # capital cost scaling
+CAPITAL_EXPONENT = 0.7            # economies of scale exponent
+OPERATING_COST_COEFF = 200.0      # operating cost scaling
+OPERATING_EXPONENT = 0.9          # non-linear operating exponent
+
+# Large distance used when GIS distance is missing
+BIG_DISTANCE = 1e6
+
+
+# ---------------
+# 2. Load data from Excel
+# -----------------------------------
+
+demand_df = pd.read_excel(DATA_FILE, sheet_name="Demand nodes")
+sites_df_raw = pd.read_excel(DATA_FILE, sheet_name="Candidate_sites")
+dist_df_raw = pd.read_excel(DATA_FILE, sheet_name="Distance_Matrix")
 
 print("DEMAND COLUMNS:", demand_df.columns.tolist())
-print("SITE COLUMNS:",   sites_df.columns.tolist())
-print("RAW DISTANCE COLUMNS (first 20):", dist_df.columns.tolist()[:20])
+print("SITE COLUMNS:", sites_df_raw.columns.tolist())
+print("DISTANCE COLUMNS (first 20):", dist_df_raw.columns.tolist()[:20])
 
-# -------------------------------------------------------------
-# 2. Clean demand data
-# -------------------------------------------------------------
-# Make Waste_proxy numeric and drop invalid
-demand_df["Waste_proxy"] = pd.to_numeric(demand_df["Waste_proxy"], errors="coerce")
-demand_df = demand_df.dropna(subset=["Waste_proxy"])
 
-# Use OBJECTID as the demand node id
+# --------------------------
+# 3. Clean demand nodes
+# ---------------------------
+
+if "OBJECTID" not in demand_df.columns:
+    raise RuntimeError("Expected 'OBJECTID' column in 'Demand nodes' sheet.")
+
+demand_df["Waste_proxy"] = pd.to_numeric(demand_df["Waste_proxy"], errors="coerce").fillna(0.0)
 demand_df = demand_df.set_index("OBJECTID")
-demand_df.index = demand_df.index.astype(int)
 
-# -------------------------------------------------------------
-# 3. Clean candidate site data
-# -------------------------------------------------------------
-# OBJECTID as site id
+
+# ------------------------
+# 4. Clean candidate sites
+# -----------------
+
+sites_df = sites_df_raw.copy()
+sites_df.rename(columns=lambda c: str(c).strip(), inplace=True)  # fix 'OBJECTID ' → 'OBJECTID'
+
+if "OBJECTID" not in sites_df.columns:
+    raise RuntimeError("Expected 'OBJECTID' column in 'Candidate_sites' sheet.")
+
 sites_df = sites_df.set_index("OBJECTID")
-sites_df.index = sites_df.index.astype(int)
 
-# Suitability numeric; if missing, drop those rows or assign default
-if "Suitability" in sites_df.columns:
-    sites_df["Suitability"] = pd.to_numeric(sites_df["Suitability"], errors="coerce")
-    sites_df = sites_df.dropna(subset=["Suitability"])
-else:
-    sites_df["Suitability"] = 1.0
+site_ids_all = sites_df.index.tolist()
+site_ids = site_ids_all[:MAX_SITES_FOR_RUN]
 
-# -------------------------------------------------------------
-# 4. Clean distance matrix
-# -------------------------------------------------------------
-# First column should be demand_id; rename if necessary
-first_col = dist_df.columns[0]
-if first_col != "demand_id":
-    dist_df = dist_df.rename(columns={first_col: "demand_id"})
 
-# Drop junk columns like "(blank)" or "Grand Total"
-drop_cols = []
-for col in dist_df.columns:
-    if isinstance(col, str):
-        c = col.strip().lower()
-        if c in ["(blank)", "grand total"]:
-            drop_cols.append(col)
-dist_df = dist_df.drop(columns=drop_cols, errors="ignore")
+# -----------
+# 5. Clean distance matrix
+# ------------------------------------------
 
-# Demand id as integer index
-dist_df["demand_id"] = pd.to_numeric(dist_df["demand_id"], errors="coerce")
-dist_df = dist_df.dropna(subset=["demand_id"])
+dist_df = dist_df_raw.copy()
+
+# First column should be demand_id
+if dist_df.columns[0] != "demand_id":
+    dist_df.rename(columns={dist_df.columns[0]: "demand_id"}, inplace=True)
+
+# Drop summary columns if present
+for col in ["(blank)", "Grand Total"]:
+    if col in dist_df.columns:
+        dist_df.drop(columns=[col], inplace=True)
+
+
+def is_int_like(v):
+    try:
+        int(v)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+# Keep only numeric demand_id rows
+dist_df = dist_df[dist_df["demand_id"].apply(is_int_like)]
 dist_df["demand_id"] = dist_df["demand_id"].astype(int)
 dist_df = dist_df.set_index("demand_id")
 
-print("CLEAN DISTANCE COLUMNS (first 20):", dist_df.columns.tolist()[:20])
-print("Distance matrix shape:", dist_df.shape)
+# Make all entries numeric (not strings)
+for col in dist_df.columns:
+    dist_df[col] = pd.to_numeric(dist_df[col], errors="coerce")
 
-# -------------------------------------------------------------
-# 5. Align demand ids between demand_df and dist_df
-# -------------------------------------------------------------
-common_demand_ids = sorted(set(demand_df.index).intersection(dist_df.index))
+# Keep only site columns that correspond to chosen site IDs
+numeric_site_cols = []
+for col in dist_df.columns:
+    try:
+        as_int = int(col)
+        if as_int in site_ids:
+            numeric_site_cols.append(as_int)
+    except (TypeError, ValueError):
+        continue
+
+dist_df = dist_df[numeric_site_cols]
+dist_df.columns = numeric_site_cols
+
+# Drop rows that are completely NaN
+dist_df = dist_df.dropna(how="all")
+
+# Replace remaining NaN distances with a big penalty distance
+dist_df = dist_df.fillna(BIG_DISTANCE)
+
+print("DISTANCE MATRIX SHAPE:", dist_df.shape)
+print(dist_df.head())
+
+
+# ----------
+# 6. Align demand and sites with distance matrix
+# ---------
+
+common_demand_ids = sorted(set(demand_df.index).intersection(set(dist_df.index)))
 demand_df = demand_df.loc[common_demand_ids]
-dist_df   = dist_df.loc[common_demand_ids]
+dist_df = dist_df.loc[common_demand_ids]
 
 print("Number of demand nodes used:", len(common_demand_ids))
 
-# -------------------------------------------------------------
-# 6. Align candidate sites between sites_df and dist_df
-# -------------------------------------------------------------
-# Distance matrix columns ≈ site ids (often numeric 1,2,3,...)
-site_cols_from_dist = []
+site_ids = sorted(set(site_ids).intersection(set(dist_df.columns)))
+sites_df = sites_df.loc[site_ids]
+dist_df = dist_df[site_ids]
 
-for col in dist_df.columns:
-    # Skip any non-numeric weirdness
-    try:
-        cid = int(col)
-        site_cols_from_dist.append(cid)
-    except Exception:
-        pass
+print("Number of candidate sites used in model:", len(site_ids))
 
-# Keep only numeric columns
-valid_dist_cols = [c for c in dist_df.columns if str(c).isdigit()]
-dist_df = dist_df[valid_dist_cols]
+# ------------------
+# 7. Build parameter dictionaries
+# ------------
 
-# Convert back to integer site IDs
-site_cols_from_dist = [int(c) for c in dist_df.columns]
-
-# Intersection of candidate sites from GIS and from distance matrix
-candidate_sites = sorted(set(site_cols_from_dist).intersection(sites_df.index))
-
-print("Total site ids in distance matrix:", len(site_cols_from_dist))
-print("Candidate sites present in sites_df:", len(candidate_sites))
-
-# -------------------------------------------------------------
-# 7. Pick a manageable subset of sites (for solver performance)
-# -------------------------------------------------------------
-TOP_N_SITES = 30  # tweak this based on your machine
-
-if len(candidate_sites) <= TOP_N_SITES:
-    selected_sites = candidate_sites
-else:
-    subset_sites_df = sites_df.loc[candidate_sites]
-    subset_sites_df = subset_sites_df.sort_values("Suitability", ascending=False)
-    selected_sites = subset_sites_df.head(TOP_N_SITES).index.tolist()
-
-print("Selected sites for optimization:", len(selected_sites))
-
-# Filter to selected sites
-sites_df = sites_df.loc[selected_sites]
-# Distance matrix columns are currently strings '1','2',... in valid_dist_cols.
-# We want them as integers matching selected_sites.
-dist_df.columns = [int(c) for c in dist_df.columns]
-dist_df = dist_df[selected_sites]
-
-# -------------------------------------------------------------
-# 8. Build sets and parameters
-# -------------------------------------------------------------
-J = list(demand_df.index)   # demand node ids
-I = list(sites_df.index)    # site ids
-
-demand_series = demand_df["Waste_proxy"]
-total_demand = float(demand_series.sum())
+demand_dict = demand_df["Waste_proxy"].to_dict()
+total_demand = float(demand_df["Waste_proxy"].sum())
 print("Total demand (sum of Waste_proxy):", total_demand)
 
-if len(I) > 0:
-    avg_demand_per_site = total_demand / len(I)
+# Simple capacity assumption (can be refined)
+if len(site_ids) > 0:
+    base_capacity = total_demand / max(1, len(site_ids) / 5.0)
 else:
-    avg_demand_per_site = 0.0
+    base_capacity = 0.0
 
-# Simple capacity assumption: each site can treat twice the average share
-capacity_per_site = 2.0 * avg_demand_per_site
-capacity_dict = {i: capacity_per_site for i in I}
+capacity_dict = {i: base_capacity for i in site_ids}
 
-# Fixed cost based on suitability (higher suitability → cheaper)
-max_suit = float(sites_df["Suitability"].max())
-min_suit = float(sites_df["Suitability"].min())
-base_fixed = 1_000_000.0
 
-fixed_cost = {}
-for i in I:
-    s = float(sites_df.loc[i, "Suitability"])
-    if max_suit > min_suit:
-        norm = (s - min_suit) / (max_suit - min_suit)
-    else:
-        norm = 0.5
-    fixed_cost[i] = base_fixed * (1.5 - 0.5 * norm)
+def dist_lookup(j, i):
+    return float(dist_df.loc[j, i])
 
-# Variable processing cost per unit (same for now)
-var_cost = {i: 50.0 for i in I}
 
-# Transport cost per km factor
-transport_cost_per_km = 1.0
+# --------------------------------------
+# 8. Build MINLP model in Pyomo
+# -------------------------------
 
-# Distance dictionary d_ij
-distance = {}
-for j in J:
-    for i in I:
-        if i in dist_df.columns:
-            d_val = dist_df.loc[j, i]
-            try:
-                distance[(j, i)] = float(d_val)
-            except Exception:
-                distance[(j, i)] = 1e6
-        else:
-            distance[(j, i)] = 1e6
-
-# -------------------------------------------------------------
-# 9. Define Pyomo model
-# -------------------------------------------------------------
 model = ConcreteModel()
 
-model.I = Set(initialize=I)
-model.J = Set(initialize=J)
+model.I = Set(initialize=site_ids)             # candidate sites
+model.J = Set(initialize=common_demand_ids)    # demand nodes
 
-model.D = Param(model.J, initialize={j: float(demand_series.loc[j]) for j in J})
-model.C = Param(model.I, initialize=capacity_dict)
-model.F = Param(model.I, initialize=fixed_cost)
-model.Cvar = Param(model.I, initialize=var_cost)
-model.Dist = Param(model.J, model.I, initialize=distance)
+model.D = Param(model.J, initialize=demand_dict, within=NonNegativeReals)
+model.Cap = Param(model.I, initialize=capacity_dict, within=NonNegativeReals)
 
-model.x = Var(model.J, model.I, domain=NonNegativeReals)
-model.y = Var(model.I, domain=Binary)
 
-# Objective
-def total_cost_rule(m):
-    fixed_part = sum(m.F[i] * m.y[i] for i in m.I)
-    flow_part = sum(
-        (m.Cvar[i] + transport_cost_per_km * m.Dist[j, i]) * m.x[j, i]
-        for j in m.J for i in m.I
-    )
-    return fixed_part + flow_part
+def distance_init(m, j, i):
+    return dist_lookup(j, i)
 
-model.TotalCost = Objective(rule=total_cost_rule, sense=minimize)
 
-# Constraints
+model.Dist = Param(model.J, model.I, initialize=distance_init, within=NonNegativeReals)
 
-def demand_satisfaction_rule(m, j):
+# Decision variables
+model.x = Var(model.J, model.I, within=NonNegativeReals)
+model.y = Var(model.I, within=Binary)
+
+
+# Total flow through each site
+def flow_rule(m, i):
+    return sum(m.x[j, i] for j in m.J)
+
+
+model.Flow = Expression(model.I, rule=flow_rule)
+
+
+# --------------
+# 9. Constraints
+# --
+
+def demand_balance_rule(m, j):
     return sum(m.x[j, i] for i in m.I) == m.D[j]
 
-model.DemandSatisfaction = Constraint(model.J, rule=demand_satisfaction_rule)
+
+model.DemandBalance = Constraint(model.J, rule=demand_balance_rule)
+
 
 def capacity_rule(m, i):
-    return sum(m.x[j, i] for j in m.J) <= m.C[i] * m.y[i]
+    return m.Flow[i] <= m.Cap[i] * m.y[i]
+
 
 model.CapacityLimit = Constraint(model.I, rule=capacity_rule)
 
-def logical_rule(m, j, i):
+
+def logical_flow_rule(m, j, i):
     return m.x[j, i] <= m.D[j] * m.y[i]
 
-model.LogicalLink = Constraint(model.J, model.I, rule=logical_rule)
 
-# -------------------------------------------------------------
-# 10. Solve
-# -------------------------------------------------------------
-solver = SolverFactory("highs")   # make sure HiGHS is installed & on PATH
+model.FlowOnlyIfOpen = Constraint(model.J, model.I, rule=logical_flow_rule)
+
+
+# ----
+# 10. Objective: non-linear cost (MINLP)
+# ---------------------
+
+transport_cost_expr = sum(
+    TRANSPORT_COST_PER_TKM * model.Dist[j, i] * model.x[j, i]
+    for j in model.J for i in model.I
+)
+
+capital_cost_expr = sum(
+    CAPITAL_COST_COEFF * (model.Flow[i] + 1.0) ** CAPITAL_EXPONENT * model.y[i]
+    for i in model.I
+)
+
+operating_cost_expr = sum(
+    OPERATING_COST_COEFF * (model.Flow[i] + 1.0) ** OPERATING_EXPONENT
+    for i in model.I
+)
+
+model.TotalCost = Objective(
+    expr=transport_cost_expr + capital_cost_expr + operating_cost_expr,
+    sense=minimize
+)
+
+
+# ---------------
+# 11. Solve with Bonmin
+# ---------------
+
+solver = SolverFactory("bonmin")
+
+if not solver.available(False):
+    raise RuntimeError(
+        "Bonmin solver is not available. "
+        "Check that 'bonmin' is on PATH for this Python environment."
+    )
+
 results = solver.solve(model, tee=True)
 
-print("Solver termination:", results.solver.termination_condition)
+
+# -------------
+# 12. Report results
+# ----------------
+
+print("\n==== SOLUTION SUMMARY ====")
 print("Solver status:", results.solver.status)
+print("Termination condition:", results.solver.termination_condition)
 
-# -------------------------------------------------------------
-# 11. Extract results
-# -------------------------------------------------------------
-opened_sites = [i for i in model.I if value(model.y[i]) > 0.5]
+try:
+    obj_value = value(model.TotalCost)
+    print("Total cost:", obj_value)
+except Exception:
+    print("Could not evaluate objective value.")
 
-print("Number of opened facilities:", len(opened_sites))
-print("Opened facility IDs:", opened_sites)
+open_sites = [i for i in model.I if value(model.y[i]) > 0.5]
+print("Number of open facilities:", len(open_sites))
+print("Open facility IDs:", open_sites)
 
-selected_sites_df = sites_df.copy()
-selected_sites_df["open"] = [1 if i in opened_sites else 0 for i in selected_sites_df.index]
-selected_sites_df.to_csv("selected_sites.csv", index_label="site_id")
+for i in open_sites:
+    flow_i = value(model.Flow[i])
+    print(f"Site {i}: throughput = {flow_i:.2f} (same units as Waste_proxy)")
+# ------------------
+# 13. Export results to CSV for GIS and further analysis
+# -----------
+import os
 
+# Convert open sites and flows into DataFrames
+open_site_ids = [i for i in model.I if value(model.y[i]) > 0.5]
+
+# 13.1 Open facilities table
+open_sites_records = []
+for i in open_site_ids:
+    flow_i = float(value(model.Flow[i]))
+    # Get site geometry / attributes from the original sites_df
+    if i in sites_df.index:
+        sx = float(sites_df.loc[i, "x_coord"])
+        sy = float(sites_df.loc[i, "y_coord"])
+        suit_val = float(sites_df.loc[i, "Suitability"])
+    else:
+        sx = float("nan")
+        sy = float("nan")
+        suit_val = float("nan")
+
+    open_sites_records.append({
+        "site_id": i,
+        "throughput": flow_i,
+        "suitability": suit_val,
+        "x_coord": sx,
+        "y_coord": sy
+    })
+
+open_sites_df = pd.DataFrame(open_sites_records)
+
+# 13.2 Flows table (only positive flows)
 flow_records = []
 for j in model.J:
     for i in model.I:
-        x_val = value(model.x[j, i])
-        if x_val is not None and x_val > 1e-6:
+        x_val = float(value(model.x[j, i]))
+        if x_val > 0.0:
+            dij = float(model.Dist[j, i])
             flow_records.append({
                 "demand_id": j,
                 "site_id": i,
-                "flow": x_val
+                "flow": x_val,
+                "distance_km": dij
             })
 
 flows_df = pd.DataFrame(flow_records)
-flows_df.to_csv("flows_demand_to_site.csv", index=False)
 
-print("Results written to:")
-print("  - selected_sites.csv")
-print("  - flows_demand_to_site.csv")
+# 13.3 Write CSVs next to the script
+output_dir = os.path.dirname(os.path.abspath(__file__))
+open_sites_path = os.path.join(output_dir, "open_facilities_results.csv")
+flows_path = os.path.join(output_dir, "flows_results.csv")
+
+open_sites_df.to_csv(open_sites_path, index=False)
+flows_df.to_csv(flows_path, index=False)
+
+print("\nResults exported:")
+print("  Open facilities  →", open_sites_path)
+print("  Flows (x_ji)     →", flows_path)
